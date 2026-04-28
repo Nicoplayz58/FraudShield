@@ -91,3 +91,5 @@ simulations/*.json
 *.json
 
 *.csv
+
+*.parquet
