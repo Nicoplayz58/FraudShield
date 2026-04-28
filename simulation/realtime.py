@@ -9,7 +9,7 @@ from typing import Any, Iterator, Literal
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from api.client import post_prediction_batch
 from db.connection import create_database_engine, get_database_url
@@ -39,6 +39,10 @@ API_FIELDS = [
     "merch_long",
     "merch_zipcode",
 ]
+
+DB_TO_API_FIELD_MAP = {
+    "longitude": "long",
+}
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -75,7 +79,20 @@ def iter_db_batches(database_url: str, table_name: str, batch_size: int, order_b
     table_name = _validate_identifier(table_name, "table_name")
     order_by = _validate_identifier(order_by, "order_by")
 
-    sql = text(f"SELECT {', '.join(API_FIELDS)} FROM {table_name} ORDER BY {order_by}")
+    inspector = inspect(engine)
+    available_columns = {column_info["name"] for column_info in inspector.get_columns(table_name)}
+    selected_columns: list[str] = []
+    for field in API_FIELDS:
+        if field in available_columns:
+            selected_columns.append(field)
+        elif field == "long" and "longitude" in available_columns:
+            selected_columns.append("longitude AS long")
+
+    missing_fields = [field for field in API_FIELDS if field not in available_columns and not (field == "long" and "longitude" in available_columns)]
+    if missing_fields:
+        raise RuntimeError(f"No se encontraron columnas requeridas en {table_name}: {missing_fields}")
+
+    sql = text(f"SELECT {', '.join(selected_columns)} FROM {table_name} ORDER BY {order_by}")
     for chunk in pd.read_sql_query(sql, engine, chunksize=batch_size):
         yield chunk[API_FIELDS].to_dict(orient="records")
 

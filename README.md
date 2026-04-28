@@ -94,3 +94,14 @@ python -m evaluation.report --database-url %DATABASE_URL%
 ```
 
 Esquema SQL disponible en `sql/predictions_schema.sql`.
+
+## Dashboard Streamlit
+
+Para levantar el dashboard de monitoreo en tiempo real:
+
+```bash
+pip install -r requirements-dashboard.txt
+streamlit run app.py
+```
+
+El dashboard usa `DATABASE_URL` y consulta PostgreSQL de forma incremental con filtros, `LIMIT` y caché de datos.

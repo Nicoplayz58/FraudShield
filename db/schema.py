@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, MetaData, Numeric, Table, Text, UniqueConstraint, func
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.engine import Engine
 
@@ -37,3 +38,16 @@ Index("ix_prediction_batches_created_at", prediction_batches.c.created_at)
 
 def ensure_prediction_schema(engine: Engine) -> None:
     metadata.create_all(engine, tables=[prediction_batches, predictions])
+
+
+def ensure_dashboard_indexes(engine: Engine) -> None:
+    statements = [
+        "CREATE INDEX IF NOT EXISTS ix_transactions_merchant ON transactions (merchant)",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_category ON transactions (category)",
+        "CREATE INDEX IF NOT EXISTS ix_transactions_trans_num ON transactions (trans_num)",
+        "CREATE INDEX IF NOT EXISTS ix_predictions_trans_num_created_at ON predictions (trans_num, created_at DESC)",
+    ]
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
