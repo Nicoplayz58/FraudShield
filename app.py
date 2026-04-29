@@ -494,8 +494,8 @@ def _render_kpis(kpis):
     cols = st.columns(4)
     cols[0].metric("Total transactions", _format_compact(total))
     cols[1].metric("Fraud count", _format_compact(frauds), delta=f"{rate:.2f}% rate", delta_color="inverse")
-    cols[2].metric("Average risk", _format_pct(kpis["avg_risk_score"]))
-    cols[3].metric("Max risk", _format_pct(kpis["max_risk_score"]))
+    cols[2].metric("Amount saved", _format_money(kpis["amount_saved"]))
+    cols[3].metric("Avg fraud amount", _format_money(kpis["avg_fraud_amount"]))
 
 
 # ---------------------------------------------------------------------------

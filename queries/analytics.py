@@ -270,6 +270,8 @@ def get_kpis(
         SELECT
             COUNT(*) AS total_transactions,
             COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN 1 ELSE 0 END), 0) AS fraud_count,
+            COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN t.amt ELSE 0 END), 0) AS amount_saved,
+            COALESCE(AVG(CASE WHEN lp.prediction IS TRUE THEN t.amt END), 0) AS avg_fraud_amount,
             COALESCE(AVG(lp.risk_score), 0) AS avg_risk_score,
             COALESCE(MAX(lp.risk_score), 0) AS max_risk_score
         FROM transactions t
@@ -285,6 +287,8 @@ def get_kpis(
     return {
         "total_transactions": float(row["total_transactions"] or 0),
         "fraud_count": float(row["fraud_count"] or 0),
+        "amount_saved": float(row["amount_saved"] or 0),
+        "avg_fraud_amount": float(row["avg_fraud_amount"] or 0),
         "avg_risk_score": float(row["avg_risk_score"] or 0),
         "max_risk_score": float(row["max_risk_score"] or 0),
     }
