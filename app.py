@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
+import time
 from datetime import date, timedelta
+from datetime import timezone
+from pathlib import Path
 from textwrap import dedent
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -20,12 +26,14 @@ from queries.analytics import (
     get_hourly_summary,
     get_kpis,
     get_merchant_summary,
+    get_prediction_date_bounds,
     get_risk_distribution,
     get_transaction_detail,
     get_unique_categories,
     get_unique_merchants,
     load_recent_transactions_with_predictions,
 )
+from simulation.realtime import SimulationConfig, run_realtime_simulation
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +45,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+SIMULATION_RUN_LOCK = threading.Lock()
+try:
+    BOGOTA_TZ = ZoneInfo("America/Bogota")
+except Exception:
+    BOGOTA_TZ = timezone(timedelta(hours=-5))
+SIMULATION_VOLUME_PRESETS = {
+    "Small (~100 transactions)": 100,
+    "Medium (~1,000 transactions)": 1000,
+    "Large (~10,000 transactions)": 10000,
+}
+SIMULATION_SPEED_PRESETS = {
+    "Slow (realistic pacing)": {"batch_size": 25, "pause_seconds": 1.0, "timeout_seconds": 30.0, "retries": 3},
+    "Normal": {"batch_size": 100, "pause_seconds": 0.25, "timeout_seconds": 25.0, "retries": 3},
+    "Fast (stress test)": {"batch_size": 500, "pause_seconds": 0.0, "timeout_seconds": 20.0, "retries": 2},
+}
+SIMULATION_STATE_DEFAULT = {
+    "running": False,
+    "status": "Idle",
+    "message": "",
+    "requested_total": 0,
+    "actual_total": 0,
+    "sent_transactions": 0,
+    "batches_sent": 0,
+    "failures": 0,
+    "progress": 0.0,
+    "started_at": None,
+    "finished_at": None,
+    "estimated_seconds": None,
+    "summary": None,
+    "error": None,
+    "params": None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +149,34 @@ def _inject_css() -> None:
             radial-gradient(1000px 500px at 100% 0%, rgba(124,92,255,0.06), transparent 60%),
             var(--bg) !important;
     }}
-    #MainMenu, footer, header[data-testid="stHeader"] {{ visibility: hidden; height: 0; }}
+    #MainMenu, footer {{ visibility: hidden; height: 0; }}
+    header[data-testid="stHeader"] {{
+        background: transparent;
+        height: 0;
+        min-height: 0;
+        overflow: visible;
+    }}
+    button[data-testid="collapsedControl"] {{
+        position: fixed;
+        top: 1.35rem;
+        left: 1rem;
+        z-index: 1000;
+        visibility: visible !important;
+        display: inline-flex !important;
+        align-items: center;
+        justify-content: center;
+        width: 2.5rem;
+        height: 2.5rem;
+        border-radius: 999px;
+        background: var(--panel) !important;
+        border: 1px solid var(--border) !important;
+        box-shadow: var(--shadow-md);
+        opacity: 0.95;
+    }}
+    button[data-testid="collapsedControl"]:hover {{
+        background: var(--accent-soft) !important;
+        border-color: var(--accent) !important;
+    }}
     .block-container {{
         padding-top: 0rem !important;
         padding-bottom: 3rem !important;
@@ -323,66 +392,79 @@ def cached_date_bounds():
     return get_date_bounds(engine=get_engine())
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def cached_prediction_date_bounds():
+    return get_prediction_date_bounds(engine=get_engine())
+
+
 @st.cache_data(ttl=5, show_spinner=False)
-def cached_recent_transactions(limit, start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_recent_transactions(limit, start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return load_recent_transactions_with_predictions(
         engine=get_engine(), limit=limit, start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=5, show_spinner=False)
-def cached_kpis(start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_kpis(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_kpis(
         engine=get_engine(), start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_fraud_over_time(start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_fraud_over_time(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_fraud_over_time(
         engine=get_engine(), start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_risk_distribution(start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_risk_distribution(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_risk_distribution(
         engine=get_engine(), start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_category_summary(top_n, start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_category_summary(top_n, start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_category_summary(
         engine=get_engine(), top_n=top_n, start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_merchant_summary(top_n, start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_merchant_summary(top_n, start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_merchant_summary(
         engine=get_engine(), top_n=top_n, start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_hourly_summary(start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_hourly_summary(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_hourly_summary(
         engine=get_engine(), start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def cached_amount_summary(start_date, end_date, min_risk_score, merchant, category, only_fraud):
+def cached_amount_summary(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant, category, only_fraud):
     return get_amount_bucket_summary(
         engine=get_engine(), start_date=start_date, end_date=end_date,
+        created_start_date=created_start_date, created_end_date=created_end_date,
         min_risk_score=min_risk_score, merchant=merchant, category=category, only_fraud=only_fraud,
     )
 
@@ -454,10 +536,262 @@ def _prediction_status_text(value):
     return "Pending"
 
 
+def _simulation_state() -> dict:
+    if "simulation_state" not in st.session_state:
+        st.session_state["simulation_state"] = dict(SIMULATION_STATE_DEFAULT)
+    return st.session_state["simulation_state"]
+
+
+def _simulation_events() -> queue.Queue:
+    if "simulation_events" not in st.session_state:
+        st.session_state["simulation_events"] = queue.Queue()
+    return st.session_state["simulation_events"]
+
+
+def _compact_count(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
+def _normalize_date_range(selected_range):
+    if isinstance(selected_range, tuple) and len(selected_range) == 2:
+        return selected_range[0], selected_range[1], True
+    return None, None, False
+
+
+def _format_bogota_datetime(value) -> str:
+    if pd.isna(value):
+        return ""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    return ts.tz_convert(BOGOTA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _estimate_eta_seconds(state: dict) -> float | None:
+    started_at = state.get("started_at")
+    sent = int(state.get("sent_transactions") or 0)
+    total = int(state.get("actual_total") or 0)
+    if not started_at or sent <= 0 or total <= sent:
+        return None
+
+    elapsed = max(time.time() - float(started_at), 0.001)
+    rate = sent / elapsed
+    if rate <= 0:
+        return None
+
+    return max((total - sent) / rate, 0.0)
+
+
+def _simulation_worker(*, params: dict[str, object], event_queue: queue.Queue) -> None:
+    acquired = False
+    try:
+        acquired = SIMULATION_RUN_LOCK.acquire(blocking=False)
+        if not acquired:
+            event_queue.put({"type": "error", "message": "Ya hay una simulación en ejecución."})
+            return
+
+        requested_total = int(params["requested_total"])
+        batch_size = int(params["batch_size"])
+        pause_seconds = float(params["pause_seconds"])
+        timeout_seconds = float(params["timeout_seconds"])
+        retries = int(params["retries"])
+        api_url = str(params["api_url"])
+        database_url = str(params.get("database_url") or os.getenv("DATABASE_URL") or "")
+        if not database_url:
+            raise RuntimeError("DATABASE_URL no esta configurada.")
+
+        event_queue.put({"type": "status", "message": "Preparando simulación...", "running": True})
+
+        iterations = max((requested_total + batch_size - 1) // batch_size, 1)
+        event_queue.put({
+            "type": "start",
+            "requested_total": requested_total,
+            "actual_total": requested_total,
+            "pool_size": requested_total,
+            "available_after_filters": requested_total,
+            "message": "Simulación en curso",
+        })
+
+        summary = run_realtime_simulation(
+            SimulationConfig(
+                source="db",
+                batch_size=batch_size,
+                iterations=iterations,
+                continuous=False,
+                pause_seconds=pause_seconds,
+                endpoint_url=api_url,
+                timeout_seconds=timeout_seconds,
+                retries=retries,
+                database_url=database_url,
+                table_name="transactions",
+                order_by="trans_num",
+            )
+        )
+
+        sent_transactions = int(summary.get("transactions_sent", 0))
+        batches_sent = int(summary.get("batches_sent", 0))
+        failures = int(summary.get("failures", 0))
+        total_latency_seconds = float(summary.get("total_latency_seconds", 0.0))
+
+        event_queue.put({
+            "type": "done",
+            "status": "Simulación completada",
+            "sent_transactions": sent_transactions,
+            "batches_sent": batches_sent,
+            "failures": failures,
+            "actual_total": sent_transactions,
+            "summary": {
+                "requested_total": requested_total,
+                "actual_total": sent_transactions,
+                "batches_sent": batches_sent,
+                "failures": failures,
+                "total_latency_seconds": total_latency_seconds,
+                "available_after_filters": requested_total,
+            },
+        })
+    except Exception as exc:
+        event_queue.put({"type": "error", "message": f"Fallo la simulación: {type(exc).__name__}: {exc}"})
+    finally:
+        if acquired and SIMULATION_RUN_LOCK.locked():
+            SIMULATION_RUN_LOCK.release()
+
+
+def _sync_simulation_state() -> bool:
+    state = _simulation_state()
+    event_queue = _simulation_events()
+    changed = False
+
+    while True:
+        try:
+            event = event_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        changed = True
+        event_type = event.get("type")
+
+        if event_type == "status":
+            state["status"] = str(event.get("message", state["status"]))
+            state["message"] = str(event.get("message", ""))
+            state["running"] = bool(event.get("running", True))
+            continue
+
+        if event_type == "warning":
+            state["message"] = str(event.get("message", ""))
+            st.session_state["simulation_warning"] = str(event.get("message", ""))
+            continue
+
+        if event_type == "start":
+            state["running"] = True
+            state["status"] = str(event.get("message", "Simulación en curso"))
+            state["message"] = str(event.get("message", ""))
+            state["requested_total"] = int(event.get("requested_total", state["requested_total"]))
+            state["actual_total"] = int(event.get("actual_total", state["actual_total"]))
+            state["sent_transactions"] = 0
+            state["batches_sent"] = 0
+            state["failures"] = 0
+            state["started_at"] = time.time()
+            state["finished_at"] = None
+            state["summary"] = None
+            state["error"] = None
+            continue
+
+        if event_type == "progress":
+            state["running"] = True
+            state["status"] = str(event.get("status", state["status"]))
+            state["sent_transactions"] = int(event.get("sent_transactions", state["sent_transactions"]))
+            state["batches_sent"] = int(event.get("batches_sent", state["batches_sent"]))
+            state["failures"] = int(event.get("failures", state["failures"]))
+            state["actual_total"] = int(event.get("actual_total", state["actual_total"]))
+            state["progress"] = (state["sent_transactions"] / state["actual_total"]) if state["actual_total"] else 0.0
+            state["estimated_seconds"] = _estimate_eta_seconds(state)
+            continue
+
+        if event_type == "done":
+            state["running"] = False
+            state["status"] = str(event.get("status", "Simulación completada"))
+            state["sent_transactions"] = int(event.get("sent_transactions", state["sent_transactions"]))
+            state["batches_sent"] = int(event.get("batches_sent", state["batches_sent"]))
+            state["failures"] = int(event.get("failures", state["failures"]))
+            state["actual_total"] = int(event.get("actual_total", state["actual_total"]))
+            state["progress"] = 1.0 if state["actual_total"] else 0.0
+            state["estimated_seconds"] = 0.0
+            state["finished_at"] = time.time()
+            state["summary"] = event.get("summary")
+            state["message"] = str(event.get("status", ""))
+            continue
+
+        if event_type == "error":
+            state["running"] = False
+            state["status"] = "Error"
+            state["error"] = str(event.get("message", ""))
+            state["message"] = str(event.get("message", ""))
+            state["finished_at"] = time.time()
+            continue
+
+    if changed:
+        st.cache_data.clear()
+
+    return changed
+
+
+def _start_simulation(*, volume_label: str, speed_label: str) -> None:
+    state = _simulation_state()
+
+    if state.get("running") or SIMULATION_RUN_LOCK.locked():
+        st.warning("Ya hay una simulación en ejecución.")
+        return
+
+    requested_total = int(SIMULATION_VOLUME_PRESETS[volume_label])
+    speed = SIMULATION_SPEED_PRESETS[speed_label]
+    params = {
+        "requested_total": requested_total,
+        "batch_size": int(speed["batch_size"]),
+        "pause_seconds": float(speed["pause_seconds"]),
+        "timeout_seconds": float(speed["timeout_seconds"]),
+        "retries": int(speed["retries"]),
+        "api_url": os.getenv("API_URL", "http://127.0.0.1:8000"),
+        "database_url": os.getenv("DATABASE_URL"),
+    }
+
+    state.update({
+        "running": True,
+        "status": "Preparando simulación...",
+        "message": "",
+        "requested_total": requested_total,
+        "actual_total": requested_total,
+        "sent_transactions": 0,
+        "batches_sent": 0,
+        "failures": 0,
+        "progress": 0.0,
+        "started_at": time.time(),
+        "finished_at": None,
+        "estimated_seconds": None,
+        "summary": None,
+        "error": None,
+        "params": params,
+    })
+    st.session_state.pop("simulation_warning", None)
+
+    event_queue = _simulation_events()
+    worker = threading.Thread(
+        target=_simulation_worker,
+        kwargs={"params": params, "event_queue": event_queue},
+        daemon=True,
+    )
+    st.session_state["simulation_thread"] = worker
+    worker.start()
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Header (single line HTML — no blank lines!)
 # ---------------------------------------------------------------------------
-def _render_header():
+def _render_header(refresh_seconds: int):
     html = (
         '<div class="fs-header">'
         '<div class="fs-brand">'
@@ -466,15 +800,16 @@ def _render_header():
         '<span class="fs-brand-name">FraudShield</span>'
         '<span class="fs-brand-sub">Real-time transaction monitoring</span>'
         '</div></div>'
-        '<div class="fs-status"><span class="pulse"></span>Live · auto-refresh 7s</div>'
+        f'<div class="fs-status"><span class="pulse"></span>Live · auto-refresh {refresh_seconds}s</div>'
         '</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
 
 
-def _render_filter_chips(start_date, end_date, merchant, category, min_risk, only_fraud):
+def _render_filter_chips(start_date, end_date, created_start_date, created_end_date, merchant, category, min_risk, only_fraud):
     chips = [
         f'<span class="fs-chip">Range <strong>{start_date} → {end_date}</strong></span>',
+        f'<span class="fs-chip">Created_at <strong>{created_start_date} → {created_end_date}</strong></span>',
         f'<span class="fs-chip">Merchant <strong>{merchant or "All"}</strong></span>',
         f'<span class="fs-chip">Category <strong>{category or "All"}</strong></span>',
         f'<span class="fs-chip">Min risk <strong>{min_risk:.2f}</strong></span>',
@@ -501,7 +836,7 @@ def _render_kpis(kpis):
 # ---------------------------------------------------------------------------
 # Sidebar (filters + builder)
 # ---------------------------------------------------------------------------
-def _render_filters(*, min_bound, max_bound, default_start, default_end):
+def _render_filters(*, min_bound, max_bound, default_start, default_end, created_min_bound, created_max_bound, created_default_start, created_default_end):
     with st.sidebar:
         sidebar_brand = (
             '<div style="display:flex;align-items:center;gap:10px;margin-bottom:1rem;">'
@@ -516,10 +851,44 @@ def _render_filters(*, min_bound, max_bound, default_start, default_end):
             st.rerun()
 
         st.markdown("### Time window")
-        selected_range = st.date_input(
-            "Date range", value=(default_start, default_end),
-            min_value=min_bound, max_value=max_bound, label_visibility="collapsed",
+        time_window_mode = st.selectbox(
+            "Range mode",
+            ["Custom range", "All historical transactions"],
+            index=0,
+            key="time_window_mode",
         )
+
+        if time_window_mode == "All historical transactions":
+            start_date = min_bound or default_start
+            end_date = max_bound or default_end
+            time_window_ready = True
+            st.caption(f"Using full history: {start_date} to {end_date}")
+        else:
+            selected_range = st.date_input(
+                "Date range", value=(default_start, default_end),
+                min_value=min_bound, max_value=max_bound, label_visibility="collapsed",
+            )
+            start_date, end_date, time_window_ready = _normalize_date_range(selected_range)
+
+        st.markdown("### Created-at window")
+        created_window_mode = st.selectbox(
+            "Created-at range mode",
+            ["Custom range", "All historical created_at"],
+            index=0,
+            key="created_window_mode",
+        )
+
+        if created_window_mode == "All historical created_at":
+            created_start_date = created_min_bound or created_default_start
+            created_end_date = created_max_bound or created_default_end
+            created_window_ready = True
+            st.caption(f"Using full created_at history: {created_start_date} to {created_end_date}")
+        else:
+            created_selected_range = st.date_input(
+                "Created-at date range", value=(created_default_start, created_default_end),
+                min_value=created_min_bound, max_value=created_max_bound, label_visibility="collapsed",
+            )
+            created_start_date, created_end_date, created_window_ready = _normalize_date_range(created_selected_range)
 
         st.markdown("### Filters")
         merchants = cached_merchants()
@@ -534,17 +903,14 @@ def _render_filters(*, min_bound, max_bound, default_start, default_end):
         top_merchants = st.slider("Top merchants/categories", 5, 20, 10, 1)
         high_risk_threshold = st.slider("High-risk threshold", 0.0, 1.0, 0.8, 0.01)
 
-    if isinstance(selected_range, tuple):
-        start_date, end_date = selected_range
-    else:
-        start_date = end_date = selected_range
-
     return (
         start_date, end_date,
+        created_start_date, created_end_date,
         None if merchant == "All" else merchant,
         None if category == "All" else category,
         float(min_risk_score), int(table_limit), bool(only_fraud),
         int(top_merchants), float(high_risk_threshold),
+        bool(time_window_ready and created_window_ready),
     )
 
 
@@ -568,6 +934,81 @@ def _render_dashboard_builder():
             key="chart_selection",
         )
     return [CHART_LABEL_TO_KEY[label] for label in selected_labels]
+
+
+def _render_simulation_control():
+    state = _simulation_state()
+
+    with st.sidebar.expander("Simulation Control", expanded=bool(state.get("running"))):
+        st.caption("Generate transactions and post them to the API in controlled batches.")
+
+        volume_label = st.selectbox(
+            "Simulation volume",
+            options=list(SIMULATION_VOLUME_PRESETS.keys()),
+            index=1,
+            key="simulation_volume_label",
+        )
+        speed_label = st.selectbox(
+            "Transaction speed",
+            options=list(SIMULATION_SPEED_PRESETS.keys()),
+            index=1,
+            key="simulation_speed_label",
+        )
+        st.caption(
+            "Slow sends smaller batches with longer pauses, Normal balances pacing and throughput, and Fast uses bigger batches with minimal pause."
+        )
+
+        expected_total = int(SIMULATION_VOLUME_PRESETS[volume_label])
+        batch_size = int(SIMULATION_SPEED_PRESETS[speed_label]["batch_size"])
+        pause_seconds = float(SIMULATION_SPEED_PRESETS[speed_label]["pause_seconds"])
+        estimated_batches = max((expected_total + batch_size - 1) // batch_size, 1)
+        estimated_duration = max(estimated_batches * pause_seconds, 0.0)
+
+        st.caption(
+            f"Estimated load: {_compact_count(expected_total)} tx · {estimated_batches} batches · ~{estimated_duration:.1f}s pacing"
+        )
+
+        start_disabled = bool(state.get("running"))
+        if st.button("Start Simulation", use_container_width=True, disabled=start_disabled):
+            _start_simulation(
+                volume_label=volume_label,
+                speed_label=speed_label,
+            )
+
+        status_box = st.empty()
+        summary_box = st.empty()
+
+        if state.get("message"):
+            status_box.info(str(state.get("message")))
+        else:
+            status_box.caption(f"Status: {state.get('status', 'Idle')}")
+
+        total = int(state.get("actual_total") or state.get("requested_total") or expected_total)
+        progress_value = float(state.get("progress") or 0.0)
+        metrics = st.columns(3)
+        metrics[0].metric("Sent", _compact_count(int(state.get("sent_transactions") or 0)))
+        metrics[1].metric("Target", _compact_count(total))
+        metrics[2].metric("Failures", _compact_count(int(state.get("failures") or 0)))
+        st.progress(int(round(max(0.0, min(progress_value, 1.0)) * 100)))
+
+        eta_seconds = state.get("estimated_seconds")
+        if state.get("running") and eta_seconds is not None:
+            eta_text = str(timedelta(seconds=max(int(eta_seconds), 0)))
+            st.caption(f"Estimated remaining time: {eta_text}")
+
+        if st.session_state.get("simulation_warning"):
+            st.warning(str(st.session_state["simulation_warning"]))
+
+        if state.get("error"):
+            summary_box.error(str(state.get("error")))
+        elif state.get("summary"):
+            summary = state["summary"] or {}
+            summary_box.success(
+                f"Completed {summary.get('actual_total', total)} transactions across {summary.get('batches_sent', 0)} batches."
+            )
+            st.caption(f"Total latency: {float(summary.get('total_latency_seconds', 0.0)):.2f}s")
+
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -705,14 +1146,19 @@ def _style_table(frame, highlight_threshold):
         .format({
             "amt": _format_money,
             "risk_score": lambda v: _format_pct(float(v)) if pd.notna(v) else "pending",
-            "created_at": lambda v: pd.to_datetime(v).strftime("%Y-%m-%d %H:%M:%S") if pd.notna(v) else "",
+            "transaction_created_at": _format_bogota_datetime,
+            "prediction_created_at": _format_bogota_datetime,
         })
     )
 
 
 def _render_top_risk_panel(latest_df):
     st.markdown('<div class="fs-card-title"><span class="fs-dot"></span>Top risky transactions</div>', unsafe_allow_html=True)
-    top_risk = latest_df.copy().sort_values(["risk_score", "created_at"], ascending=[False, False], na_position="last").head(5)
+    top_risk = latest_df.copy()
+    sort_created_at = top_risk["prediction_created_at"].fillna(top_risk["transaction_created_at"])
+    top_risk = top_risk.assign(_sort_created_at=sort_created_at).sort_values(
+        ["risk_score", "_sort_created_at"], ascending=[False, False], na_position="last"
+    ).head(5)
     if top_risk.empty:
         st.info("No transactions found.")
         return
@@ -730,24 +1176,37 @@ def _render_top_risk_panel(latest_df):
 # ---------------------------------------------------------------------------
 def main():
     _inject_css()
-    st_autorefresh(interval=7000, key="fraudshield_autorefresh")
+
+    _sync_simulation_state()
+    refresh_interval = 1000 if _simulation_state().get("running") else 7000
+    st_autorefresh(interval=refresh_interval, key="fraudshield_autorefresh")
 
     min_bound, max_bound = cached_date_bounds()
+    created_min_bound, created_max_bound = cached_prediction_date_bounds()
     default_end = max_bound or date.today()
     default_start = min_bound or (default_end - timedelta(days=7))
+    created_default_end = created_max_bound or date.today()
+    created_default_start = created_min_bound or (created_default_end - timedelta(days=7))
 
-    _render_header()
+    _render_header(max(int(refresh_interval / 1000), 1))
 
     (
-        start_date, end_date, merchant_value, category_value, min_risk_score,
-        latest_limit, only_fraud, top_merchants, high_risk_threshold,
+        start_date, end_date, created_start_date, created_end_date, merchant_value, category_value, min_risk_score,
+        latest_limit, only_fraud, top_merchants, high_risk_threshold, filters_ready,
     ) = _render_filters(
         min_bound=min_bound, max_bound=max_bound,
         default_start=default_start, default_end=default_end,
+        created_min_bound=created_min_bound, created_max_bound=created_max_bound,
+        created_default_start=created_default_start, created_default_end=created_default_end,
     )
     selected_chart_keys = _render_dashboard_builder()
+    _render_simulation_control()
 
-    _render_filter_chips(start_date, end_date, merchant_value, category_value, min_risk_score, only_fraud)
+    if not filters_ready:
+        st.info("Complete both date ranges to run the queries.")
+        st.stop()
+
+    _render_filter_chips(start_date, end_date, created_start_date, created_end_date, merchant_value, category_value, min_risk_score, only_fraud)
 
     need_fraud_time = any(k in {"fraud_over_time", "avg_risk_over_time"} for k in selected_chart_keys)
     need_category = any(k.startswith("category_") for k in selected_chart_keys)
@@ -758,33 +1217,33 @@ def main():
 
     try:
         with st.spinner("Loading data…"):
-            kpis = cached_kpis(start_date, end_date, min_risk_score, merchant_value, category_value, only_fraud)
+            kpis = cached_kpis(start_date, end_date, created_start_date, created_end_date, min_risk_score, merchant_value, category_value, only_fraud)
             latest_df = cached_recent_transactions(
-                int(latest_limit), start_date, end_date, float(min_risk_score),
+                int(latest_limit), start_date, end_date, created_start_date, created_end_date, float(min_risk_score),
                 merchant_value, category_value, bool(only_fraud),
             )
             fraud_time = (
-                cached_fraud_over_time(start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_fraud_over_time(start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_fraud_time else pd.DataFrame()
             )
             category_summary = (
-                cached_category_summary(int(top_merchants), start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_category_summary(int(top_merchants), start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_category else None
             )
             merchant_summary = (
-                cached_merchant_summary(int(top_merchants), start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_merchant_summary(int(top_merchants), start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_merchant else None
             )
             hourly_summary = (
-                cached_hourly_summary(start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_hourly_summary(start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_hourly else None
             )
             amount_summary = (
-                cached_amount_summary(start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_amount_summary(start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_amount else None
             )
             risk_dist = (
-                cached_risk_distribution(start_date, end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
+                cached_risk_distribution(start_date, end_date, created_start_date, created_end_date, float(min_risk_score), merchant_value, category_value, bool(only_fraud))
                 if need_risk_dist else None
             )
     except Exception as exc:
@@ -825,7 +1284,7 @@ def main():
 
         table_df = latest_df.copy()
         table_df["prediction_status"] = table_df["prediction"].map(_prediction_status_text)
-        table_df = table_df[["trans_num", "amt", "merchant", "category", "risk_score", "prediction_status", "rank", "created_at"]]
+        table_df = table_df[["trans_num", "amt", "merchant", "category", "risk_score", "prediction_status", "rank", "transaction_created_at", "prediction_created_at"]]
         st.dataframe(
             _style_table(table_df, float(high_risk_threshold)),
             use_container_width=True, hide_index=True, height=520,
@@ -853,8 +1312,8 @@ def main():
                     "amt": detail.get("amt"),
                     "risk_score": detail.get("risk_score"),
                     "prediction": detail.get("prediction"),
-                    "batch_id": detail.get("batch_id"),
-                    "prediction_created_at": detail.get("prediction_created_at"),
+                    "transaction_created_at": _format_bogota_datetime(detail.get("trans_date_trans_time")),
+                    "prediction_created_at": _format_bogota_datetime(detail.get("prediction_created_at")),
                 }])
                 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 

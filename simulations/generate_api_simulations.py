@@ -68,6 +68,10 @@ class Knobs:
     travel_boost: float = 1.0
 
 
+def _build_trans_num(run_id: str, sequence: int) -> str:
+    return f"sim_{run_id}_{sequence:08d}_{uuid4().hex}"
+
+
 def haversine_km(lat1: np.ndarray, lon1: np.ndarray, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
     r = 6371.0
     p1 = np.radians(lat1)
@@ -359,6 +363,7 @@ def generate_records(
     rng = np.random.default_rng(seed)
     fake = Faker("en_US")
     Faker.seed(seed)
+    run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
     df = pd.read_csv(base_csv)
     prof = _build_profiles(df, knobs)
@@ -409,7 +414,7 @@ def generate_records(
                 "city_pop": int(user["city_pop"]),
                 "job": user["job"],
                 "dob": user["dob"],
-                "trans_num": uuid4().hex,
+                "trans_num": _build_trans_num(run_id, len(records) + 1),
                 "unix_time": int(ts.timestamp()),
                 "merch_lat": round(mlat, 6),
                 "merch_long": round(mlon, 6),

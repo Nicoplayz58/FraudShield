@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from db.connection import create_database_engine, get_database_url
+from db.schema import PREDICTION_EVENT_FIELDS
 
 
 def _get_engine(engine: Engine | None = None, database_url: str | None = None) -> Engine:
@@ -17,6 +18,7 @@ def _get_engine(engine: Engine | None = None, database_url: str | None = None) -
 
 
 def _latest_predictions_scope_sql(body_sql: str) -> str:
+    payload_columns_sql = ",\n                ".join(f"p.{column_name}" for column_name in PREDICTION_EVENT_FIELDS)
     return f"""
         WITH latest_predictions AS (
             SELECT
@@ -26,6 +28,7 @@ def _latest_predictions_scope_sql(body_sql: str) -> str:
                 p.prediction,
                 p.created_at,
                 p.id,
+                {payload_columns_sql},
                 ROW_NUMBER() OVER (
                     PARTITION BY p.trans_num
                     ORDER BY p.created_at DESC, p.id DESC
@@ -46,11 +49,11 @@ def _fetch_single_column_list(sql: str, *, engine: Engine | None = None, databas
 def get_unique_merchants(*, engine: Engine | None = None, database_url: str | None = None) -> list[str]:
     return _fetch_single_column_list(
         """
-        SELECT DISTINCT t.merchant
-        FROM transactions t
-        WHERE t.merchant IS NOT NULL
-          AND BTRIM(t.merchant) <> ''
-        ORDER BY t.merchant ASC
+                SELECT DISTINCT p.merchant
+                FROM predictions p
+                WHERE p.merchant IS NOT NULL
+                    AND BTRIM(p.merchant) <> ''
+                ORDER BY p.merchant ASC
         """,
         engine=engine,
         database_url=database_url,
@@ -60,11 +63,11 @@ def get_unique_merchants(*, engine: Engine | None = None, database_url: str | No
 def get_unique_categories(*, engine: Engine | None = None, database_url: str | None = None) -> list[str]:
     return _fetch_single_column_list(
         """
-        SELECT DISTINCT t.category
-        FROM transactions t
-        WHERE t.category IS NOT NULL
-          AND BTRIM(t.category) <> ''
-        ORDER BY t.category ASC
+                SELECT DISTINCT p.category
+                FROM predictions p
+                WHERE p.category IS NOT NULL
+                    AND BTRIM(p.category) <> ''
+                ORDER BY p.category ASC
         """,
         engine=engine,
         database_url=database_url,
@@ -75,12 +78,15 @@ def _prediction_filters(
     *,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
     only_fraud: bool = False,
-    created_at_alias: str = "p.created_at",
-    prediction_alias: str = "p",
+    created_at_alias: str = "lp.trans_date_trans_time",
+    created_filter_alias: str | None = "lp.created_at",
+    prediction_alias: str = "lp",
 ) -> tuple[str, dict[str, Any]]:
     clauses = ["1 = 1"]
     params: dict[str, Any] = {}
@@ -93,16 +99,24 @@ def _prediction_filters(
         clauses.append(f"{created_at_alias} < (CAST(:end_date AS DATE) + INTERVAL '1 day')")
         params["end_date"] = end_date
 
+    if created_start_date is not None and created_filter_alias is not None:
+        clauses.append(f"{created_filter_alias} >= :created_start_date")
+        params["created_start_date"] = created_start_date
+
+    if created_end_date is not None and created_filter_alias is not None:
+        clauses.append(f"{created_filter_alias} < (CAST(:created_end_date AS DATE) + INTERVAL '1 day')")
+        params["created_end_date"] = created_end_date
+
     if min_risk_score is not None:
         clauses.append(f"{prediction_alias}.risk_score >= :min_risk_score")
         params["min_risk_score"] = float(min_risk_score)
 
     if merchant:
-        clauses.append("t.merchant = :merchant")
+        clauses.append(f"{prediction_alias}.merchant = :merchant")
         params["merchant"] = merchant
 
     if category:
-        clauses.append("t.category = :category")
+        clauses.append(f"{prediction_alias}.category = :category")
         params["category"] = category
 
     if only_fraud:
@@ -112,6 +126,19 @@ def _prediction_filters(
 
 
 def get_date_bounds(*, engine: Engine | None = None, database_url: str | None = None) -> tuple[date | None, date | None]:
+    engine = _get_engine(engine, database_url)
+    sql = text(
+        """
+        SELECT MIN(p.trans_date_trans_time)::date AS min_date, MAX(p.trans_date_trans_time)::date AS max_date
+        FROM predictions p
+        """
+    )
+    with engine.connect() as connection:
+        row = connection.execute(sql).mappings().one()
+    return row["min_date"], row["max_date"]
+
+
+def get_prediction_date_bounds(*, engine: Engine | None = None, database_url: str | None = None) -> tuple[date | None, date | None]:
     engine = _get_engine(engine, database_url)
     sql = text(
         """
@@ -132,6 +159,8 @@ def load_recent_transactions_with_predictions(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -141,12 +170,12 @@ def load_recent_transactions_with_predictions(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
     params["limit"] = int(limit)
     params["offset"] = max(int(offset), 0)
@@ -161,6 +190,7 @@ def load_recent_transactions_with_predictions(
                 p.prediction,
                 p.created_at,
                 p.id,
+                {",\n                ".join(f"p.{column_name}" for column_name in PREDICTION_EVENT_FIELDS)},
                 ROW_NUMBER() OVER (
                     PARTITION BY p.trans_num
                     ORDER BY p.created_at DESC, p.id DESC
@@ -168,11 +198,11 @@ def load_recent_transactions_with_predictions(
             FROM predictions p
         )
         SELECT
-            t.trans_num,
-            t.trans_date_trans_time,
-            t.amt,
-            t.merchant,
-            t.category,
+            lp.trans_num,
+            lp.trans_date_trans_time,
+            lp.amt,
+            lp.merchant,
+            lp.category,
             lp.batch_id,
             lp.risk_score,
             COALESCE(
@@ -185,15 +215,14 @@ def load_recent_transactions_with_predictions(
             ) AS prediction,
             lp.prediction AS prediction_raw,
             ROW_NUMBER() OVER (
-                ORDER BY COALESCE(lp.risk_score, -1) DESC, COALESCE(lp.created_at, t.trans_date_trans_time) DESC, t.trans_num ASC
+                ORDER BY COALESCE(lp.risk_score, -1) DESC, lp.trans_date_trans_time DESC, lp.trans_num ASC
             ) AS rank,
-            COALESCE(lp.created_at, t.trans_date_trans_time) AS created_at
-        FROM transactions t
-        LEFT JOIN latest_predictions lp
-            ON lp.trans_num = t.trans_num
-           AND lp.rn = 1
-        WHERE {where_clause}
-        ORDER BY COALESCE(lp.risk_score, -1) DESC, COALESCE(lp.created_at, t.trans_date_trans_time) DESC, t.trans_num ASC
+            lp.trans_date_trans_time AS transaction_created_at,
+            lp.created_at AS prediction_created_at
+        FROM latest_predictions lp
+        WHERE lp.rn = 1
+          AND {where_clause}
+        ORDER BY COALESCE(lp.risk_score, -1) DESC, lp.trans_date_trans_time DESC, lp.trans_num ASC
         LIMIT :limit OFFSET :offset
         """
     )
@@ -210,6 +239,8 @@ def load_latest_predictions(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -222,6 +253,8 @@ def load_latest_predictions(
         database_url=database_url,
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
@@ -235,6 +268,8 @@ def get_kpis(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -244,12 +279,12 @@ def get_kpis(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
 
     sql = text(
@@ -261,6 +296,7 @@ def get_kpis(
                 p.prediction,
                 p.created_at,
                 p.id,
+                {",\n                ".join(f"p.{column_name}" for column_name in PREDICTION_EVENT_FIELDS)},
                 ROW_NUMBER() OVER (
                     PARTITION BY p.trans_num
                     ORDER BY p.created_at DESC, p.id DESC
@@ -270,14 +306,11 @@ def get_kpis(
         SELECT
             COUNT(*) AS total_transactions,
             COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN 1 ELSE 0 END), 0) AS fraud_count,
-            COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN t.amt ELSE 0 END), 0) AS amount_saved,
-            COALESCE(AVG(CASE WHEN lp.prediction IS TRUE THEN t.amt END), 0) AS avg_fraud_amount,
+            COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN lp.amt ELSE 0 END), 0) AS amount_saved,
+            COALESCE(AVG(CASE WHEN lp.prediction IS TRUE THEN lp.amt END), 0) AS avg_fraud_amount,
             COALESCE(AVG(lp.risk_score), 0) AS avg_risk_score,
             COALESCE(MAX(lp.risk_score), 0) AS max_risk_score
-        FROM transactions t
-        LEFT JOIN latest_predictions lp
-            ON lp.trans_num = t.trans_num
-           AND lp.rn = 1
+        FROM latest_predictions lp
         WHERE {where_clause}
         """
     )
@@ -300,6 +333,8 @@ def get_fraud_over_time(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -309,6 +344,8 @@ def get_fraud_over_time(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
@@ -316,18 +353,19 @@ def get_fraud_over_time(
     )
 
     sql = text(
-        f"""
-        SELECT
-            DATE(p.created_at) AS date,
-            SUM(CASE WHEN p.prediction THEN 1 ELSE 0 END) AS fraud_count,
-            AVG(p.risk_score) AS avg_risk_score
-        FROM predictions p
-        INNER JOIN transactions t
-            ON t.trans_num = p.trans_num
-        WHERE {where_clause}
-        GROUP BY DATE(p.created_at)
-        ORDER BY date
-        """
+        _latest_predictions_scope_sql(
+            f"""
+            SELECT
+                DATE(lp.trans_date_trans_time) AS date,
+                SUM(CASE WHEN lp.prediction THEN 1 ELSE 0 END) AS fraud_count,
+                AVG(lp.risk_score) AS avg_risk_score
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
+            GROUP BY DATE(lp.trans_date_trans_time)
+            ORDER BY date
+            """
+        )
     )
     with engine.connect() as connection:
         frame = pd.read_sql_query(sql, connection, params=params)
@@ -341,6 +379,8 @@ def get_merchant_ranking(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -350,6 +390,8 @@ def get_merchant_ranking(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
@@ -358,20 +400,21 @@ def get_merchant_ranking(
     params["top_n"] = int(top_n)
 
     sql = text(
-        f"""
-        SELECT
-            t.merchant,
-            SUM(CASE WHEN p.prediction THEN 1 ELSE 0 END) AS fraud_count,
-            AVG(p.risk_score) AS avg_risk_score
-        FROM predictions p
-        INNER JOIN transactions t
-            ON t.trans_num = p.trans_num
-        WHERE {where_clause}
-        GROUP BY t.merchant
-        HAVING SUM(CASE WHEN p.prediction THEN 1 ELSE 0 END) > 0
-        ORDER BY fraud_count DESC, avg_risk_score DESC, t.merchant ASC
-        LIMIT :top_n
-        """
+        _latest_predictions_scope_sql(
+            f"""
+            SELECT
+                lp.merchant,
+                SUM(CASE WHEN lp.prediction THEN 1 ELSE 0 END) AS fraud_count,
+                AVG(lp.risk_score) AS avg_risk_score
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
+            GROUP BY lp.merchant
+            HAVING SUM(CASE WHEN lp.prediction THEN 1 ELSE 0 END) > 0
+            ORDER BY fraud_count DESC, avg_risk_score DESC, lp.merchant ASC
+            LIMIT :top_n
+            """
+        )
     )
     with engine.connect() as connection:
         frame = pd.read_sql_query(sql, connection, params=params)
@@ -384,6 +427,8 @@ def get_risk_distribution(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -393,6 +438,8 @@ def get_risk_distribution(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
@@ -400,27 +447,27 @@ def get_risk_distribution(
     )
 
     sql = text(
-        f"""
-        WITH bucketed AS (
+        _latest_predictions_scope_sql(
+            f"""
             SELECT
-                LEAST(9, GREATEST(0, FLOOR(COALESCE(p.risk_score, 0) * 10)::int)) AS bucket_index
-            FROM predictions p
-            INNER JOIN transactions t
-                ON t.trans_num = p.trans_num
-            WHERE {where_clause}
+                CONCAT(
+                    TO_CHAR(bucket_index / 10.0, 'FM0.0'),
+                    ' - ',
+                    TO_CHAR((bucket_index + 1) / 10.0, 'FM0.0')
+                ) AS risk_score_bucket,
+                COUNT(*) AS count,
+                bucket_index
+            FROM (
+                SELECT
+                    LEAST(9, GREATEST(0, FLOOR(COALESCE(lp.risk_score, 0) * 10)::int)) AS bucket_index
+                FROM latest_predictions lp
+                WHERE lp.rn = 1
+                  AND {where_clause}
+            ) bucketed
+            GROUP BY bucket_index
+            ORDER BY bucket_index
+            """
         )
-        SELECT
-            CONCAT(
-                TO_CHAR(bucket_index / 10.0, 'FM0.0'),
-                ' - ',
-                TO_CHAR((bucket_index + 1) / 10.0, 'FM0.0')
-            ) AS risk_score_bucket,
-            COUNT(*) AS count,
-            bucket_index
-        FROM bucketed
-        GROUP BY bucket_index
-        ORDER BY bucket_index
-        """
     )
     with engine.connect() as connection:
         frame = pd.read_sql_query(sql, connection, params=params)
@@ -435,57 +482,49 @@ def get_transaction_detail(
 ) -> pd.DataFrame:
     engine = _get_engine(engine, database_url)
     sql = text(
-        """
-        SELECT
-            t.trans_num,
-            t.trans_date_trans_time,
-            t.unix_time,
-            t.cc_num,
-            t.merchant,
-            t.category,
-            t.amt,
-            t.first,
-            t.last,
-            t.gender,
-            t.job,
-            t.dob,
-            t.street,
-            t.city,
-            t.state,
-            t.zip,
-            t.lat,
-            t.longitude,
-            t.city_pop,
-            t.merch_lat,
-            t.merch_long,
-            t.merch_zipcode,
-            p.batch_id,
-            p.risk_score,
-            COALESCE(
-                CASE
-                    WHEN p.prediction IS TRUE THEN 'fraud'
-                    WHEN p.prediction IS FALSE THEN 'legit'
-                    ELSE NULL
-                END,
-                'pending'
-            ) AS prediction,
-            p.prediction AS prediction_raw,
-            p.created_at AS prediction_created_at
-        FROM transactions t
-        LEFT JOIN LATERAL (
+        _latest_predictions_scope_sql(
+            """
             SELECT
-                p.batch_id,
-                p.risk_score,
-                p.prediction,
-                p.created_at
-            FROM predictions p
-            WHERE p.trans_num = t.trans_num
-            ORDER BY p.created_at DESC, p.id DESC
+                lp.trans_num,
+                lp.trans_date_trans_time,
+                lp.unix_time,
+                lp.cc_num,
+                lp.merchant,
+                lp.category,
+                lp.amt,
+                lp.first,
+                lp.last,
+                lp.gender,
+                lp.job,
+                lp.dob,
+                lp.street,
+                lp.city,
+                lp.state,
+                lp.zip,
+                lp.lat,
+                lp.long,
+                lp.city_pop,
+                lp.merch_lat,
+                lp.merch_long,
+                lp.merch_zipcode,
+                lp.batch_id,
+                lp.risk_score,
+                COALESCE(
+                    CASE
+                        WHEN lp.prediction IS TRUE THEN 'fraud'
+                        WHEN lp.prediction IS FALSE THEN 'legit'
+                        ELSE NULL
+                    END,
+                    'pending'
+                ) AS prediction,
+                lp.prediction AS prediction_raw,
+                lp.created_at AS prediction_created_at
+            FROM latest_predictions lp
+            WHERE lp.trans_num = :trans_num
+              AND lp.rn = 1
             LIMIT 1
-        ) p ON TRUE
-        WHERE t.trans_num = :trans_num
-        LIMIT 1
-        """
+            """
+        )
     )
     with engine.connect() as connection:
         frame = pd.read_sql_query(sql, connection, params={"trans_num": trans_num})
@@ -499,6 +538,8 @@ def get_category_summary(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -508,12 +549,12 @@ def get_category_summary(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
     params["top_n"] = int(top_n)
 
@@ -521,7 +562,7 @@ def get_category_summary(
         _latest_predictions_scope_sql(
             f"""
             SELECT
-                t.category,
+                lp.category,
                 COUNT(*) AS transaction_count,
                 COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN 1 ELSE 0 END), 0) AS fraud_count,
                 COALESCE(
@@ -530,14 +571,12 @@ def get_category_summary(
                 ) AS fraud_rate,
                 COALESCE(AVG(lp.risk_score), 0) AS avg_risk_score,
                 COALESCE(MAX(lp.risk_score), 0) AS max_risk_score,
-                COALESCE(SUM(t.amt), 0) AS total_amount
-            FROM transactions t
-            LEFT JOIN latest_predictions lp
-                ON lp.trans_num = t.trans_num
-               AND lp.rn = 1
-            WHERE {where_clause}
-            GROUP BY t.category
-            ORDER BY fraud_count DESC, fraud_rate DESC, avg_risk_score DESC, t.category ASC
+                COALESCE(SUM(lp.amt), 0) AS total_amount
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
+            GROUP BY lp.category
+            ORDER BY fraud_count DESC, fraud_rate DESC, avg_risk_score DESC, lp.category ASC
             LIMIT :top_n
             """
         )
@@ -554,6 +593,8 @@ def get_merchant_summary(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -563,12 +604,12 @@ def get_merchant_summary(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
     params["top_n"] = int(top_n)
 
@@ -576,7 +617,7 @@ def get_merchant_summary(
         _latest_predictions_scope_sql(
             f"""
             SELECT
-                t.merchant,
+                lp.merchant,
                 COUNT(*) AS transaction_count,
                 COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN 1 ELSE 0 END), 0) AS fraud_count,
                 COALESCE(
@@ -585,14 +626,12 @@ def get_merchant_summary(
                 ) AS fraud_rate,
                 COALESCE(AVG(lp.risk_score), 0) AS avg_risk_score,
                 COALESCE(MAX(lp.risk_score), 0) AS max_risk_score,
-                COALESCE(SUM(t.amt), 0) AS total_amount
-            FROM transactions t
-            LEFT JOIN latest_predictions lp
-                ON lp.trans_num = t.trans_num
-               AND lp.rn = 1
-            WHERE {where_clause}
-            GROUP BY t.merchant
-            ORDER BY fraud_count DESC, fraud_rate DESC, avg_risk_score DESC, t.merchant ASC
+                COALESCE(SUM(lp.amt), 0) AS total_amount
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
+            GROUP BY lp.merchant
+            ORDER BY fraud_count DESC, fraud_rate DESC, avg_risk_score DESC, lp.merchant ASC
             LIMIT :top_n
             """
         )
@@ -608,6 +647,8 @@ def get_hourly_summary(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -617,19 +658,19 @@ def get_hourly_summary(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
 
     sql = text(
         _latest_predictions_scope_sql(
             f"""
             SELECT
-                EXTRACT(HOUR FROM COALESCE(lp.created_at, t.trans_date_trans_time))::int AS hour_of_day,
+                EXTRACT(HOUR FROM lp.trans_date_trans_time)::int AS hour_of_day,
                 COUNT(*) AS transaction_count,
                 COALESCE(SUM(CASE WHEN lp.prediction IS TRUE THEN 1 ELSE 0 END), 0) AS fraud_count,
                 COALESCE(
@@ -638,12 +679,10 @@ def get_hourly_summary(
                 ) AS fraud_rate,
                 COALESCE(AVG(lp.risk_score), 0) AS avg_risk_score,
                 COALESCE(MAX(lp.risk_score), 0) AS max_risk_score
-            FROM transactions t
-            LEFT JOIN latest_predictions lp
-                ON lp.trans_num = t.trans_num
-               AND lp.rn = 1
-            WHERE {where_clause}
-            GROUP BY EXTRACT(HOUR FROM COALESCE(lp.created_at, t.trans_date_trans_time))
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
+            GROUP BY EXTRACT(HOUR FROM lp.trans_date_trans_time)
             ORDER BY hour_of_day ASC
             """
         )
@@ -660,6 +699,8 @@ def get_amount_bucket_summary(
     database_url: str | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
+    created_start_date: date | None = None,
+    created_end_date: date | None = None,
     min_risk_score: float | None = None,
     merchant: str | None = None,
     category: str | None = None,
@@ -669,12 +710,12 @@ def get_amount_bucket_summary(
     where_clause, params = _prediction_filters(
         start_date=start_date,
         end_date=end_date,
+        created_start_date=created_start_date,
+        created_end_date=created_end_date,
         min_risk_score=min_risk_score,
         merchant=merchant,
         category=category,
         only_fraud=only_fraud,
-        created_at_alias="COALESCE(lp.created_at, t.trans_date_trans_time)",
-        prediction_alias="lp",
     )
     params["bucket_size"] = float(bucket_size)
 
@@ -688,6 +729,7 @@ def get_amount_bucket_summary(
                 p.prediction,
                 p.created_at,
                 p.id,
+                {",\n                ".join(f"p.{column_name}" for column_name in PREDICTION_EVENT_FIELDS)},
                 ROW_NUMBER() OVER (
                     PARTITION BY p.trans_num
                     ORDER BY p.created_at DESC, p.id DESC
@@ -696,15 +738,13 @@ def get_amount_bucket_summary(
         ),
         bucketed AS (
             SELECT
-                FLOOR(COALESCE(t.amt, 0) / :bucket_size) * :bucket_size AS bucket_start,
+                FLOOR(COALESCE(lp.amt, 0) / :bucket_size) * :bucket_size AS bucket_start,
                 lp.risk_score,
                 lp.prediction,
-                t.trans_num
-            FROM transactions t
-            LEFT JOIN latest_predictions lp
-                ON lp.trans_num = t.trans_num
-               AND lp.rn = 1
-            WHERE {where_clause}
+                lp.trans_num
+            FROM latest_predictions lp
+            WHERE lp.rn = 1
+              AND {where_clause}
         )
         SELECT
             bucket_start,

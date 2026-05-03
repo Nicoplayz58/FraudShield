@@ -8,7 +8,7 @@ from uuid import uuid4
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 
-from db.schema import ensure_prediction_schema, prediction_batches, predictions as predictions_table
+from db.schema import PREDICTION_EVENT_FIELDS, ensure_prediction_schema, prediction_batches, predictions as predictions_table
 
 
 def _canonicalize_transactions(transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -56,14 +56,16 @@ def persist_prediction_batch(
 
     prediction_rows: list[dict[str, Any]] = []
     for transaction, score, prediction in zip(transactions, risk_scores, predictions):
-        prediction_rows.append(
-            {
-                "id": uuid4(),
-                "trans_num": str(transaction["trans_num"]),
-                "risk_score": float(score),
-                "prediction": bool(int(prediction)),
-            }
-        )
+        row = {
+            "id": uuid4(),
+            "batch_id": None,
+            "trans_num": str(transaction["trans_num"]),
+            "risk_score": float(score),
+            "prediction": bool(int(prediction)),
+        }
+        for field in PREDICTION_EVENT_FIELDS:
+            row[field] = transaction.get(field)
+        prediction_rows.append(row)
 
     with engine.begin() as connection:
         batch_stmt = pg_insert(prediction_batches).values(batch_values)
