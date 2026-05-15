@@ -42,7 +42,7 @@ def build_pipeline(X: pd.DataFrame) -> Pipeline:
 
     for col in [c for c in X.columns if is_datetime64_any_dtype(X[c])]:
         raise ValueError(
-            f"La columna {col!r} es datetime. Convierte el dataset a formato de modelado antes de entrenar."
+            f"La columna {col!r} sigue siendo datetime. Debe convertirse o eliminarse antes de entrenar."
         )
 
     preprocessor = ColumnTransformer(
@@ -95,6 +95,11 @@ def _build_training_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 
     y = pd.to_numeric(df[TARGET_COL], errors="coerce").fillna(0).astype(int)
     X = df.drop(columns=[TARGET_COL]).copy()
+
+    datetime_cols = X.select_dtypes(include=["datetime64[ns]", "datetimetz"]).columns.tolist()
+    if datetime_cols:
+        X = X.drop(columns=datetime_cols)
+
     return X, y
 
 
