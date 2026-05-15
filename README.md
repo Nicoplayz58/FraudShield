@@ -69,6 +69,17 @@ python save_lightgbm_model.py --input credit_card_transactions_model_input.csv -
 
 En el benchmark actual, LightGBM fue el mejor modelo en holdout por PR-AUC.
 
+## Databricks
+
+Para llevar el flujo a Databricks, usa la carpeta [databricks/](databricks/) y empieza por su guía principal en [databricks/README.md](databricks/README.md). Ese flujo usa Spark para la preparación de datos dentro de Databricks y MLflow para versionar los entrenamientos.
+
+Ahí tienes:
+
+1. Los scripts ejecutables para feature engineering y entrenamiento con MLflow.
+2. Las rutas sugeridas para subir el CSV al Unity Catalog Volume `/Volumes/ml/fraudshield/data`.
+3. Los pasos para conectar VS Code con Databricks sin perder el control del repo.
+4. La forma de revisar los runs y comparar modelos en MLflow.
+
 ## Backend de fraud detection
 
 Para ejecutar el pipeline backend completo:

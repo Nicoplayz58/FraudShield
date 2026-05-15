@@ -93,3 +93,4 @@ simulations/*.json
 *.csv
 
 *.parquet
+.databricks
